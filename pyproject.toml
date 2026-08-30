@@ -1,0 +1,14 @@
+[project]
+name = "walkinglab"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "filterpy>=1.4.5",
+    "nicegui>=3.16.0",
+    "numpy>=2.5.2",
+    "opencv-python>=5.0.0.93",
+    "pytest>=9.1.1",
+    "ultralytics>=8.4.135",
+]

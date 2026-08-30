@@ -1,0 +1,27 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Data and Models
+*.mp4
+*.avi
+*.mov
+*.pt
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
