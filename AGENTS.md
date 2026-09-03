@@ -35,3 +35,7 @@ For every user prompt requiring code changes, the agent must orchestrate a struc
    * The Tester re-runs the tests.
 3. This loop repeats iteratively until all tests pass successfully.
 4. **Final Step:** Update `Architecture.md` to reflect any new structural changes introduced during the cycle.
+---
+
+## 4. Git & Committing Rule
+* **Rule:** Never auto-commit changes to the git repository. When a task is complete, notify the user and ask them to perform the commit.
