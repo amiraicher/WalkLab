@@ -14,6 +14,17 @@ from ultralytics import YOLO
 
 import sys
 
+BATCH_SIZE = 4
+_empirical_single_input_time = 0.41  # Fallback guess: ~2.4 FPS for B=1
+
+def update_empirical_time(time_taken: float):
+    """Updates the exponential moving average of single input inference time."""
+    global _empirical_single_input_time
+    _empirical_single_input_time = (_empirical_single_input_time * 0.8) + (time_taken * 0.2)
+
+def get_empirical_time() -> float:
+    return _empirical_single_input_time
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -46,15 +57,19 @@ class PoseEstimator:
         # Initialize native OpenVINO Core
         core = ov.Core()
         
+        # Read model and reshape with dynamic batch dimension [-1]
+        model = core.read_model(model_path)
+        model.reshape({0: ov.PartialShape([-1, 3, 640, 640])})
+        
         # CPU is used here. OpenVINO will automatically optimize for Intel CPUs.
-        self.compiled_model = core.compile_model(model_path, "CPU")
+        self.compiled_model = core.compile_model(model, "CPU")
         self.infer_request = self.compiled_model.create_infer_request()
         
         self.input_layer = self.compiled_model.input(0)
         
-        # Typically shape is [1, 3, 640, 640]
-        self.input_shape = self.input_layer.shape
-        self.img_size = (self.input_shape[2], self.input_shape[3])
+        # Typically shape is [-1, 3, 640, 640], extract H and W
+        # Using 640 static for img_size
+        self.img_size = (640, 640)
 
     def preprocess(self, image: np.ndarray) -> tuple[np.ndarray, float, tuple]:
         """
@@ -150,23 +165,23 @@ class PoseEstimator:
     def infer(self, image: np.ndarray) -> list[dict]:
         """
         Helper to run the full inference pipeline (preprocess, infer, postprocess) on an image array.
-        
-        Parameters
-        ----------
-        image : numpy.ndarray
-            The BGR image array.
-            
-        Returns
-        -------
-        list of dict
-            List of marker coordinates.
+        Performs synchronous inference on a single image.
         """
+        t0 = time.perf_counter()
+        
         img_tensor, scale_ratio, pad = self.preprocess(image)
         
+        # OpenVINO synchronous inference
         results = self.infer_request.infer([img_tensor])
+        
+        # Get output tensor
         output = next(iter(results.values()))
         
         markers = self.postprocess(output, image.shape)
+        
+        t1 = time.perf_counter()
+        update_empirical_time(t1 - t0)
+        
         return markers
 
     def predict(self, frame_data_b64: str) -> list[dict]:
@@ -233,7 +248,7 @@ def process_frame(frame_data: str):
 
 def process_video_file(file_info: dict) -> list:
     """
-    Processes a video file asynchronously using OpenVINO AsyncInferQueue.
+    Processes a video file asynchronously using OpenVINO AsyncInferQueue with B=8 batching.
     """
     video_path = file_info.get("path")
     if not video_path:
@@ -250,16 +265,25 @@ def process_video_file(file_info: dict) -> list:
     infer_queue = ov.AsyncInferQueue(est.compiled_model, 0)
     
     def callback(request, userdata):
-        frame_idx, orig_shape = userdata
+        batch_indices, batch_shapes = userdata
         output = next(iter(request.results.values()))
-        markers = est.postprocess(output, orig_shape)
-        all_markers[frame_idx] = markers
-        
+        # output is shape [B, 300, 57]
+        for i, (idx, orig_shape) in enumerate(zip(batch_indices, batch_shapes)):
+            # postprocess expects shape [1, 300, 57]
+            single_output = np.expand_dims(output[i], axis=0)
+            markers = est.postprocess(single_output, orig_shape)
+            all_markers[idx] = markers
+            
     infer_queue.set_callback(callback)
     
     frame_idx = 0
     t_start = time.perf_counter()
-    logger.info(f"🚀 [Batch Mode] Starting Async inference on {video_path}...")
+    logger.info(f"🚀 [Batch Mode] Starting Async inference (B=4) on {video_path}...")
+    
+    batch_size = 4
+    batch_tensors = []
+    batch_shapes = []
+    batch_indices = []
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -267,14 +291,29 @@ def process_video_file(file_info: dict) -> list:
             break
             
         img_tensor, scale_ratio, pad = est.preprocess(frame)
-        
-        # Start inference concurrently (blocks only if the queue is full)
-        infer_queue.start_async([img_tensor], userdata=(frame_idx, frame.shape))
+        # img_tensor is [1, 3, 640, 640], extract to [3, 640, 640] for stacking
+        batch_tensors.append(img_tensor[0])
+        batch_shapes.append(frame.shape)
+        batch_indices.append(frame_idx)
         
         frame_idx += 1
-        if frame_idx % 100 == 0:
+        
+        # Dispatch when batch is full
+        if len(batch_tensors) == batch_size:
+            batched_input = np.array(batch_tensors)
+            infer_queue.start_async([batched_input], userdata=(batch_indices, batch_shapes))
+            batch_tensors = []
+            batch_shapes = []
+            batch_indices = []
+            
+        if frame_idx % 80 == 0:
             logger.info(f"[Batch Mode] Queued {frame_idx} frames...")
             
+    # Dispatch remaining frames
+    if batch_tensors:
+        batched_input = np.array(batch_tensors)
+        infer_queue.start_async([batched_input], userdata=(batch_indices, batch_shapes))
+        
     # Wait for the remaining frames in the queue to finish processing
     infer_queue.wait_all()
     cap.release()

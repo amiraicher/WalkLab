@@ -20,5 +20,27 @@ async def upload_video(file: UploadFile = File(...)):
         
     return markers
 
+@app.get('/api/estimate')
+def estimate_time(frames: int):
+    """
+    Estimates the time required for batch inference based on empirical tracking.
+
+    Parameters
+    ----------
+    frames : int
+        The total number of frames in the uploaded video.
+
+    Returns
+    -------
+    dict
+        A dictionary containing the 'estimated_seconds' key.
+    """
+    single_input_time = inference.get_empirical_time()
+    batch_size = inference.BATCH_SIZE
+    
+    # Formula: single input inference time * number of frames / batch size
+    estimated_seconds = single_input_time * (frames / batch_size)
+    return {"estimated_seconds": estimated_seconds}
+
 if __name__ in {"__main__", "__mp_main__"}:
     run_app()

@@ -44,9 +44,20 @@ export default {
             </svg>
 
             <!-- Reset overlay button -->
-            <button v-if="activeMode" @click="stop" class="absolute top-4 right-4 bg-red-600/80 hover:bg-red-700 text-white px-3 py-1 rounded text-sm shadow backdrop-blur-sm transition">
+            <button v-if="activeMode" @click="stop" class="absolute top-4 right-4 bg-red-600/80 hover:bg-red-700 text-white px-3 py-1 rounded text-sm shadow backdrop-blur-sm transition z-10">
                 Close Media
             </button>
+
+            <!-- Progress Overlay -->
+            <div v-if="progressStage" class="absolute inset-0 flex items-center justify-center bg-black/70 z-50 backdrop-blur-sm">
+                <div class="bg-slate-800 p-6 rounded-xl shadow-2xl w-80 text-center border border-slate-700">
+                    <div class="text-white text-lg font-semibold mb-4">{{ progressStage }}</div>
+                    <div class="w-full bg-slate-700 rounded-full h-3 mb-2 overflow-hidden">
+                        <div class="bg-blue-500 h-3 rounded-full transition-all duration-300 ease-out" :style="{ width: progressPercent + '%' }"></div>
+                    </div>
+                    <div class="text-sm text-slate-400">{{ Math.round(progressPercent) }}%</div>
+                </div>
+            </div>
         </div>
     `,
     data() {
@@ -56,7 +67,10 @@ export default {
             markers: [],
             all_frames_markers: [],
             animationFrameId: null,
-            isProcessing: false
+            isProcessing: false,
+            progressStage: '',
+            progressPercent: 0,
+            estimatedSeconds: 0
         }
     },
     methods: {
@@ -92,28 +106,80 @@ export default {
                 
                 this.$emit('file_uploaded_start', { name: file.name });
                 
-                // Use HTTP POST instead of WebSocket to avoid memory crash on large files
-                const formData = new FormData();
-                formData.append('file', file);
-                
-                try {
-                    const response = await fetch('/api/upload_video', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
-                    if (response.ok) {
-                        const markers = await response.json();
-                        this.all_frames_markers = markers;
-                        this.$emit('file_uploaded_success', { name: file.name });
-                    } else {
-                        console.error('Upload failed');
-                        this.$emit('error', 'Video processing failed');
+                video.onloadedmetadata = async () => {
+                    let duration = video.duration;
+                    if (!duration || isNaN(duration) || !isFinite(duration)) {
+                        duration = 10; // robust fallback
                     }
-                } catch (e) {
-                    console.error(e);
-                    this.$emit('error', 'Network error during upload');
-                }
+                    const assumedFps = 30;
+                    const totalFrames = Math.floor(duration * assumedFps);
+                    
+                    try {
+                        const estRes = await fetch(`/api/estimate?frames=${totalFrames}`);
+                        const estData = await estRes.json();
+                        this.estimatedSeconds = estData.estimated_seconds;
+                    } catch (e) {
+                        this.estimatedSeconds = totalFrames / 5.23;
+                    }
+                    
+                    this.progressStage = 'Uploading video...';
+                    this.progressPercent = 0;
+                    
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('POST', '/api/upload_video', true);
+                    
+                    let analyzingStarted = false;
+                    
+                    xhr.upload.onprogress = (e) => {
+                        if (e.lengthComputable && this.progressStage === 'Uploading video...') {
+                            this.progressPercent = (e.loaded / e.total) * 100;
+                            
+                            // Transition to Analyzing perfectly when upload hits 100%
+                            if (e.loaded >= e.total && !analyzingStarted) {
+                                analyzingStarted = true;
+                                this.progressStage = 'Analyzing pose...';
+                                this.progressPercent = 0;
+                                
+                                const startTime = performance.now();
+                                const durationMs = (this.estimatedSeconds || 10) * 1000;
+                                
+                                const animateProgress = (now) => {
+                                    if (this.progressStage !== 'Analyzing pose...') return;
+                                    
+                                    const elapsed = now - startTime;
+                                    let percent = (elapsed / durationMs) * 100;
+                                    if (percent > 99) percent = 99; // Hold at 99%
+                                    
+                                    this.progressPercent = percent;
+                                    requestAnimationFrame(animateProgress);
+                                };
+                                requestAnimationFrame(animateProgress);
+                            }
+                        }
+                    };
+                    
+                    xhr.onload = () => {
+                        this.progressStage = '';
+                        if (xhr.status === 200) {
+                            const markers = JSON.parse(xhr.responseText);
+                            this.all_frames_markers = markers;
+                            this.$emit('file_uploaded_success', { name: file.name });
+                        } else {
+                            console.error('Upload failed');
+                            this.$emit('error', 'Video processing failed');
+                        }
+                    };
+                    
+                    xhr.onerror = () => {
+                        this.progressStage = '';
+                        console.error('Network error during upload');
+                        this.$emit('error', 'Network error during upload');
+                    };
+                    
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    xhr.send(formData);
+                };
                 
                 this.syncMarkers();
                 event.target.value = '';
