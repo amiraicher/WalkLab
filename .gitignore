@@ -25,3 +25,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+*.xml
+*.bin
+*_openvino_model/

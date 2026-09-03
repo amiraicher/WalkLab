@@ -8,7 +8,7 @@ def render():
         # Left Panel (2/3 width): Unified media frame
         with ui.column().classes('col-span-2 h-full border border-gray-200 rounded-xl shadow-lg bg-white overflow-hidden'):
             tracker = VideoTracker(
-                on_upload=lambda e: ui.notify(f'Loaded video {e["name"]} for annotation.', type='info')
+                on_file_uploaded_success=lambda e: ui.notify(f'Loaded video {e["name"]} for annotation.', type='info')
             ).classes('w-full h-full')
             
         # Right Panel (1/3 width): Annotation controls

@@ -8,6 +8,7 @@ dependencies = [
     "filterpy>=1.4.5",
     "nicegui>=3.16.0",
     "numpy>=2.5.2",
+    "onnxruntime-openvino>=1.24.1",
     "opencv-python>=5.0.0.93",
     "pytest>=9.1.1",
     "ultralytics>=8.4.135",

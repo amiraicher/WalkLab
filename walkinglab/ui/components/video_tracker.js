@@ -54,7 +54,9 @@ export default {
             activeMode: null, // 'webcam' or 'file'
             stream: null,
             markers: [],
-            animationFrameId: null
+            all_frames_markers: [],
+            animationFrameId: null,
+            isProcessing: false
         }
     },
     methods: {
@@ -76,7 +78,7 @@ export default {
                 this.$emit('error', 'Could not access webcam');
             }
         },
-        handleFileUpload(event) {
+        async handleFileUpload(event) {
             const file = event.target.files[0];
             if (file) {
                 const url = URL.createObjectURL(file);
@@ -86,19 +88,44 @@ export default {
                 video.setAttribute('controls', 'true');
                 video.load();
                 this.activeMode = 'file';
+                this.all_frames_markers = [];
                 
-                // Trigger backend processing
-                this.$emit('file_uploaded', { name: file.name, size: file.size });
+                this.$emit('file_uploaded_start', { name: file.name });
                 
-                // Sync dummy markers with playback
+                // Use HTTP POST instead of WebSocket to avoid memory crash on large files
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                try {
+                    const response = await fetch('/api/upload_video', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (response.ok) {
+                        const markers = await response.json();
+                        this.all_frames_markers = markers;
+                        this.$emit('file_uploaded_success', { name: file.name });
+                    } else {
+                        console.error('Upload failed');
+                        this.$emit('error', 'Video processing failed');
+                    }
+                } catch (e) {
+                    console.error(e);
+                    this.$emit('error', 'Network error during upload');
+                }
+                
                 this.syncMarkers();
-                
-                // Reset file input so same file can be uploaded again if needed
                 event.target.value = '';
             }
         },
         captureFrame() {
             if (this.activeMode !== 'webcam') return;
+            if (this.isProcessing) {
+                // Wait until the previous frame finishes processing
+                setTimeout(() => this.captureFrame(), 50);
+                return;
+            }
             
             const video = this.$refs.videoElement;
             const canvas = this.$refs.hiddenCanvas;
@@ -109,37 +136,69 @@ export default {
                 const ctx = canvas.getContext('2d');
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 
-                // Emit frame to backend (base64 string)
                 const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                this.isProcessing = true;
                 this.$emit('frame_ready', dataUrl);
             }
             
-            // Loop at ~10 FPS for backend processing
-            setTimeout(() => this.captureFrame(), 100);
+            setTimeout(() => this.captureFrame(), 30);
+        },
+        calculateVideoBounds() {
+            const video = this.$refs.videoElement;
+            const rect = video.getBoundingClientRect();
+            const videoRatio = video.videoWidth / video.videoHeight;
+            const containerRatio = rect.width / rect.height;
+            
+            let actualWidth, actualHeight, offsetX, offsetY;
+            
+            if (videoRatio > containerRatio) {
+                actualWidth = rect.width;
+                actualHeight = rect.width / videoRatio;
+                offsetX = 0;
+                offsetY = (rect.height - actualHeight) / 2;
+            } else {
+                actualHeight = rect.height;
+                actualWidth = rect.height * videoRatio;
+                offsetX = (rect.width - actualWidth) / 2;
+                offsetY = 0;
+            }
+            
+            return { actualWidth, actualHeight, offsetX, offsetY };
         },
         syncMarkers() {
             if (!this.activeMode) return;
             
-            const video = this.$refs.videoElement;
-            if (video && video.readyState >= video.HAVE_METADATA) {
-                // Ensure video dimensions are known to map coordinates correctly
-                const rect = video.getBoundingClientRect();
-                
-                // Dummy logic: animate 2 connected markers bouncing around
-                const time = performance.now() / 1000;
-                
-                // Center of the video element
-                const cx = rect.width / 2;
-                const cy = rect.height / 2;
-                const radius = Math.min(cx, cy) * 0.5;
-                
-                this.markers = [
-                    { x: cx + Math.sin(time) * radius, y: cy + Math.cos(time) * radius },
-                    { x: cx + Math.cos(time * 1.5) * radius, y: cy + Math.sin(time * 1.5) * radius }
-                ];
+            if (this.activeMode === 'file' && this.all_frames_markers && this.all_frames_markers.length > 0) {
+                const video = this.$refs.videoElement;
+                if (video && video.readyState >= video.HAVE_METADATA && video.videoWidth > 0) {
+                    const bounds = this.calculateVideoBounds();
+                    
+                    const frameIndex = Math.floor(video.currentTime * 30);
+                    if (frameIndex < this.all_frames_markers.length) {
+                        const markers = this.all_frames_markers[frameIndex] || [];
+                        this.markers = markers.map(m => ({
+                            x: bounds.offsetX + (m.x * bounds.actualWidth),
+                            y: bounds.offsetY + (m.y * bounds.actualHeight)
+                        }));
+                    }
+                }
             }
             
             this.animationFrameId = requestAnimationFrame(this.syncMarkers);
+        },
+        update_markers(markers) {
+            this.isProcessing = false;
+            const video = this.$refs.videoElement;
+            if (video && video.readyState >= video.HAVE_METADATA && video.videoWidth > 0) {
+                const bounds = this.calculateVideoBounds();
+                this.markers = markers.map(m => ({
+                    x: bounds.offsetX + (m.x * bounds.actualWidth),
+                    y: bounds.offsetY + (m.y * bounds.actualHeight)
+                }));
+            }
+        },
+        set_batch_markers(all_markers) {
+            this.all_frames_markers = all_markers;
         },
         stop() {
             if (this.stream) {

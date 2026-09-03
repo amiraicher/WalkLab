@@ -1,4 +1,4 @@
-from nicegui import ui
+from nicegui import ui, run
 from walkinglab.ui.components.video_tracker import VideoTracker
 import walkinglab.backend.inference as inference
 
@@ -8,9 +8,20 @@ def render():
     with ui.grid(columns=3).classes('w-full gap-6 h-[700px]'):
         # Left Panel (2/3 width): Unified media frame
         with ui.column().classes('col-span-2 h-full border border-gray-200 rounded-xl shadow-lg bg-white overflow-hidden'):
+            async def handle_frame(e):
+                markers = await run.cpu_bound(inference.process_frame, e)
+                tracker.run_method('update_markers', markers)
+                
+            def handle_upload_start(e):
+                ui.notify(f'Batch processing initiated for: {e["name"]}', type='info')
+                
+            def handle_upload_success(e):
+                ui.notify('Batch processing complete.', type='positive')
+                
             tracker = VideoTracker(
-                on_frame=lambda e: inference.process_frame(e),
-                on_upload=lambda e: ui.notify(f'Batch processing initiated for: {e["name"]}', type='info')
+                on_frame=handle_frame,
+                on_file_uploaded_start=handle_upload_start,
+                on_file_uploaded_success=handle_upload_success
             ).classes('w-full h-full')
             
         # Right Panel (1/3 width): Wizard-style instruction panel
