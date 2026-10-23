@@ -5,6 +5,9 @@ The system uses a decoupled architecture to isolate the Python backend (inferenc
 
 ## Modules
 
+### 0. Package Root (`walkinglab`)
+- **__init__.py**: Performs platform initialization. On Windows (`win32`), registers the virtual environment's root (`sys.prefix`) and `Scripts` directory via `os.add_dll_directory` and `PATH` so bundled `msvc-runtime` DLLs (`msvcp140.dll`, `vcruntime140.dll`, etc.) are resolved by OpenVINO (`_pyopenvino`) and PyTorch (`c10.dll`) even when launched through `uv`'s wrapper executable.
+
 ### 1. UI Package (`walkinglab.ui`)
 Built with NiceGUI, leveraging Vue 3 custom components for high-performance video overlays.
 - **app.py**: Main entry point for the NiceGUI app, manages tabs and API routes (e.g. `/api/upload_video`).
