@@ -19,9 +19,9 @@ Built with NiceGUI, leveraging Vue 3 custom components for high-performance vide
 
 ### 2. Backend Package (`walkinglab.backend`)
 Handles data processing and model inference. Exposes data (e.g., JSON coordinates) rather than rendered frames.
-- **inference.py**: Handles OpenVINO CPU-accelerated model execution (`YOLO-Pose`), running in dynamically-reshaped batch sizes. It supports dual modes:
-  - **Live Webcam (`infer`)**: Synchronous inference for real-time `B=1` streaming.
-  - **Video File (`process_video_file`)**: Asynchronous, highly-optimized `B=4` processing using `ov.AsyncInferQueue` to maximize CPU throughput. Maintains empirical ETA data.
+- **inference.py**: Handles OpenVINO CPU-accelerated model execution (`YOLO-Pose`), sharing a single base `ov.Model`, preprocessor (`preprocess`), and postprocessor (`postprocess`) across two dedicated, statically-shaped compilation pipelines (`_compile_pipeline`):
+  - **Live Webcam (`realtime_compiled_model` / `infer` / `predict`)**: Compiled eagerly with static input shape `[1, 3, 640, 640]` (`REALTIME_BATCH_SIZE = 1`) and `ov.properties.hint.PerformanceMode.LATENCY` to spread single-frame execution across CPU cores for minimum latency.
+  - **Video File (`batch_compiled_model` / `process_video_file`)**: Compiled lazily with static input shape `[4, 3, 640, 640]` (`BATCH_SIZE = 4`) and `ov.properties.hint.PerformanceMode.THROUGHPUT`, executed asynchronously via `ov.AsyncInferQueue`. Trailing partial batches (`< 4` frames) are zero-padded via `_pad_batch` to preserve the static input shape while unpacking only valid frames. Maintains empirical ETA data.
 - **filtering.py**: Implements Kalman Filtering for signal stabilization and noise reduction of the raw trajectories.
 - **analysis.py**: Calculates spatiotemporal parameters (stride, cadence) and kinematic curves from the smoothed trajectories.
 
@@ -31,13 +31,13 @@ The system supports two distinct real-time pipelines:
 ### A. Live Webcam Pipeline
 1. Frontend captures frames via HTML5 hidden canvas.
 2. `video_tracker.js` emits Base64 image strings to NiceGUI (WebSockets).
-3. Backend performs synchronous `B=1` inference.
+3. Backend decodes the frame in `predict` and delegates to `infer`, executing synchronous `B=1` inference on the static `[1, 3, 640, 640]` `LATENCY`-optimized model.
 4. JSON coordinates returned and mapped to an SVG overlay.
 
 ### B. File Upload Batch Pipeline
 1. Frontend calculates exact duration and asks backend for an empirical ETA estimate (`/api/estimate`).
 2. Video is uploaded to the backend via `XMLHttpRequest` (tracking upload bytes).
 3. Backend streams the MP4 to disk (`shutil.copyfileobj`) avoiding RAM bloat.
-4. Backend `AsyncInferQueue` batches frames (`B=4`) for high-throughput OpenVINO CPU processing.
+4. Backend `AsyncInferQueue` batches frames (`B=4`, padding trailing partial batches via `_pad_batch`) for high-throughput OpenVINO CPU processing on the static `[4, 3, 640, 640]` `THROUGHPUT`-optimized model.
 5. Frontend animates the "Analyzing pose..." bar using `requestAnimationFrame`.
 6. JSON coordinates are returned in bulk and synced chronologically to the HTML5 video playback.
