@@ -17,6 +17,8 @@ import torch
 from ultralytics import YOLO
 from ultralytics.utils.ops import scale_coords
 
+from walkinglab.backend.filtering import RealtimeFrameBufferInterpolator
+
 REALTIME_BATCH_SIZE = 1
 BATCH_SIZE = 4
 MODEL_INPUT_SIZE = (640, 640)
@@ -208,7 +210,7 @@ class PoseEstimator:
         Returns
         -------
         list of dict
-            A list of visible keypoint dictionaries ``{"x": float, "y": float}``
+            A list of visible keypoint dictionaries ``{"id": int, "x": float, "y": float}``
             normalized to ``[0, 1]`` relative to the original image dimensions.
         """
         # output is [1, 300, 57] where 57 = 4(bbox) + 1(conf) + 1(cls) + 51(17 keypoints * 3)
@@ -236,10 +238,10 @@ class PoseEstimator:
 
         markers = []
         height, width = orig_img_shape[:2]
-        for keypoint in scaled_kpts[0]:
+        for kp_idx, keypoint in enumerate(scaled_kpts[0]):
             x, y, visibility = keypoint.tolist()
             if visibility > 0.5:
-                markers.append({"x": x / width, "y": y / height})
+                markers.append({"id": kp_idx, "x": x / width, "y": y / height})
 
         return markers
 
@@ -331,8 +333,9 @@ def _pad_batch(
     return batched
 
 
-# Global singleton for the estimator
+# Global singletons for the estimator and real-time frame buffer interpolator
 estimator: PoseEstimator | None = None
+realtime_interpolator: RealtimeFrameBufferInterpolator | None = None
 
 
 def get_estimator() -> PoseEstimator:
@@ -350,21 +353,140 @@ def get_estimator() -> PoseEstimator:
     return estimator
 
 
-def process_frame(frame_data: str) -> list[dict]:
+def get_realtime_interpolator() -> RealtimeFrameBufferInterpolator:
     """
-    Processes a real-time webcam frame encoded in base64 and returns marker positions.
-
-    Parameters
-    ----------
-    frame_data : str
-        Base64-encoded image string from the webcam feed.
+    Retrieves the global ``RealtimeFrameBufferInterpolator`` singleton.
 
     Returns
     -------
-    list of dict
-        List of normalized keypoint marker coordinates ``{"x": float, "y": float}``.
+    RealtimeFrameBufferInterpolator
+        The active real-time frame buffer interpolator instance.
     """
-    return get_estimator().predict(frame_data)
+    global realtime_interpolator
+    if realtime_interpolator is None:
+        realtime_interpolator = RealtimeFrameBufferInterpolator()
+    return realtime_interpolator
+
+
+def configure_realtime_interpolator(
+    buffer_delay_ms: int | None = None,
+    dilation_factor: int | None = None,
+    method: str | None = None,
+    auto_adjust_buffer: bool | None = None,
+    max_buffer_delay_ms: int | None = None,
+) -> dict:
+    """
+    Configures the global ``RealtimeFrameBufferInterpolator`` parameters at runtime.
+
+    Parameters
+    ----------
+    buffer_delay_ms : int, optional
+        Target playback buffer delay in milliseconds.
+    dilation_factor : int, optional
+        Frame dilation stride (infer every ``N``-th frame).
+    method : str, optional
+        Marker interpolation strategy (``"linear"``, ``"kalman"``, or ``"none"``).
+    auto_adjust_buffer : bool, optional
+        Whether to automatically increase ``buffer_delay_ms`` when inference
+        exceeds half of the current buffer delay.
+    max_buffer_delay_ms : int, optional
+        Maximum allowed buffer delay in milliseconds.
+
+    Returns
+    -------
+    dict
+        Active configuration dictionary from the interpolator.
+    """
+    interpolator = get_realtime_interpolator()
+    return interpolator.configure(
+        buffer_delay_ms=buffer_delay_ms,
+        dilation_factor=dilation_factor,
+        method=method,
+        auto_adjust_buffer=auto_adjust_buffer,
+        max_buffer_delay_ms=max_buffer_delay_ms,
+    )
+
+
+def process_frame(
+    frame_data: str | dict,
+    frame_index: int | None = None,
+) -> list[dict] | dict:
+    """
+    Processes a real-time webcam frame and returns marker coordinates or an indexed payload.
+
+    Supports two invocation modes:
+    1. **Legacy mode**: When ``frame_data`` is a base64 ``str`` and ``frame_index`` is
+       ``None``, returns ``list[dict]`` of normalized keypoint markers directly.
+    2. **Indexed real-time mode**: When ``frame_data`` is a ``dict`` containing
+       ``"frame_index"`` and ``"frame_data"`` (or when ``frame_index`` is explicitly
+       provided), runs single-frame inference, records the result in the real-time
+       interpolator, interpolates intermediate dilated frames, and checks whether
+       inference latency exceeded half of the buffer window.
+
+    Parameters
+    ----------
+    frame_data : str or dict
+        Either a base64-encoded image string, or a dictionary with keys
+        ``"frame_index"`` (int) and ``"frame_data"`` (str), plus optional tuning
+        keys ``"buffer_delay_ms"``, ``"dilation_factor"``, ``"interpolation_method"``,
+        and ``"inference_time_ms"``.
+    frame_index : int, optional
+        Explicit sequential index of the frame when ``frame_data`` is passed as a ``str``.
+
+    Returns
+    -------
+    list of dict or dict
+        In legacy mode, a list of keypoint marker dictionaries. In indexed mode,
+        a dictionary containing ``frame_index``, ``markers``, ``interpolated_frames``,
+        ``interpolation_method``, ``buffer_delay_ms``, ``buffer_adjusted``,
+        ``inference_time_ms``, and ``dilation_factor``.
+    """
+    if isinstance(frame_data, str) and frame_index is None:
+        return get_estimator().predict(frame_data)
+
+    interpolator = get_realtime_interpolator()
+
+    if isinstance(frame_data, dict):
+        idx = int(frame_data.get("frame_index", 0 if frame_index is None else frame_index))
+        b64_str = frame_data["frame_data"]
+        if any(
+            key in frame_data
+            for key in ("buffer_delay_ms", "dilation_factor", "interpolation_method")
+        ):
+            interpolator.configure(
+                buffer_delay_ms=frame_data.get("buffer_delay_ms"),
+                dilation_factor=frame_data.get("dilation_factor"),
+                method=frame_data.get("interpolation_method"),
+            )
+    else:
+        idx = int(frame_index)  # type: ignore[arg-type]
+        b64_str = frame_data
+
+    t_start = time.perf_counter()
+    markers = get_estimator().predict(b64_str)
+    measured_ms = (time.perf_counter() - t_start) * 1000.0
+
+    if isinstance(frame_data, dict) and "inference_time_ms" in frame_data:
+        inference_time_ms = float(frame_data["inference_time_ms"])
+    else:
+        inference_time_ms = measured_ms
+
+    interpolated = interpolator.record_inference(
+        idx,
+        markers,
+        inference_time_ms=inference_time_ms,
+    )
+
+    return {
+        "frame_index": idx,
+        "markers": markers,
+        "interpolated_frames": interpolated,
+        "interpolation_method": interpolator.method,
+        "buffer_delay_ms": interpolator.buffer_delay_ms,
+        "buffer_adjusted": interpolator.last_buffer_adjusted,
+        "inference_time_ms": inference_time_ms,
+        "dilation_factor": interpolator.dilation_factor,
+    }
 
 
 def process_video_file(file_info: dict) -> list:

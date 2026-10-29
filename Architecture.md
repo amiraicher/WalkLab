@@ -15,24 +15,28 @@ Built with NiceGUI, leveraging Vue 3 custom components for high-performance vide
 - **pose.py**: Visualizer for the extracted pose keypoints over video frames.
 - **settings.py**: Controls for loading videos, connecting cameras, and tuning filter hyperparameters.
 - **metrics.py**: Dashboard for longitudinal trend analysis and kinematic curves.
-- **components/video_tracker.js**: Custom Vue 3 component that orchestrates both live webcam streaming and HTTP video file uploads, handling letterboxing calculations, precise ETA progress bars, and SVG marker synchronization.
+- **components/video_tracker.py & components/video_tracker.js**: Custom Vue 3 component (`VideoTracker`) that orchestrates both live webcam streaming and HTTP video file uploads. In live webcam mode, maintains a tunable **200 ms delayed frame buffer** rendered onto a dedicated `<canvas ref="displayCanvas">`, assigns a sequential `frame_index` to every captured frame, dilates inference dispatch (default `1` in `4` frames), interpolates marker coordinates across intermediate frames, and dynamically expands the buffer delay (with console warnings) if backend inference latency exceeds half the buffer duration.
 
 ### 2. Backend Package (`walkinglab.backend`)
 Handles data processing and model inference. Exposes data (e.g., JSON coordinates) rather than rendered frames.
-- **inference.py**: Handles OpenVINO CPU-accelerated model execution (`YOLO-Pose`), sharing a single base `ov.Model`, preprocessor (`preprocess`), and postprocessor (`postprocess`) across two dedicated, statically-shaped compilation pipelines (`_compile_pipeline`):
-  - **Live Webcam (`realtime_compiled_model` / `infer` / `predict`)**: Compiled eagerly with static input shape `[1, 3, 640, 640]` (`REALTIME_BATCH_SIZE = 1`) and `ov.properties.hint.PerformanceMode.LATENCY` to spread single-frame execution across CPU cores for minimum latency.
+- **inference.py**: Handles OpenVINO CPU-accelerated model execution (`YOLO-Pose`), sharing a single base `ov.Model`, preprocessor (`preprocess`), and postprocessor (`postprocess` — outputting normalized `{"id": int, "x": float, "y": float}` keypoints) across two dedicated, statically-shaped compilation pipelines (`_compile_pipeline`):
+  - **Live Webcam (`realtime_compiled_model` / `infer` / `predict` / `process_frame`)**: Compiled eagerly with static input shape `[1, 3, 640, 640]` (`REALTIME_BATCH_SIZE = 1`) and `ov.properties.hint.PerformanceMode.LATENCY`. `process_frame` supports both legacy raw Base64 strings and indexed frame payloads (`{"frame_index": int, "frame_data": str}`), associating returning detections with their original `frame_index`, computing intermediate frame markers via `RealtimeFrameBufferInterpolator`, and monitoring inference duration against the buffer budget.
   - **Video File (`batch_compiled_model` / `process_video_file`)**: Compiled lazily with static input shape `[4, 3, 640, 640]` (`BATCH_SIZE = 4`) and `ov.properties.hint.PerformanceMode.THROUGHPUT`, executed asynchronously via `ov.AsyncInferQueue`. Trailing partial batches (`< 4` frames) are zero-padded via `_pad_batch` to preserve the static input shape while unpacking only valid frames. Maintains empirical ETA data.
-- **filtering.py**: Implements Kalman Filtering for signal stabilization and noise reduction of the raw trajectories.
+- **filtering.py**: Implements NumPy-based (`np.interp`) real-time frame interpolation (`interpolate_frame_sequence`) and the stateful `RealtimeFrameBufferInterpolator` (keeping `smooth_trajectory` as a placeholder stub since offline batch mode infers every frame directly):
+  - Supports tunable interpolation strategies (`"linear"`, `"kalman"`, `"none"`). For each marker `id`, constructs an index vector and interpolates `(x, y)` over `range(index.min(), index.max() + 1)` via `np.interp`.
+  - Manages real-time frame dilation (`DEFAULT_DILATION_FACTOR = 4`) and display buffer timing (`DEFAULT_BUFFER_DELAY_MS = 200`).
+  - **Adaptive Buffer Scaling (`check_and_adjust_buffer`)**: Automatically checks whether single-frame inference latency exceeds half the current buffer duration ($T_{\text{inference}} > 0.5 \cdot T_{\text{buffer}}$). When exceeded, logs a `WARNING` and dynamically expands `buffer_delay_ms` ($\lceil 2.2 \times T_{\text{inference}} \rceil$, up to `MAX_BUFFER_DELAY_MS = 2000`) so two inference keyframes always fit inside the display delay window.
 - **analysis.py**: Calculates spatiotemporal parameters (stride, cadence) and kinematic curves from the smoothed trajectories.
 
 ## Data Flow
 The system supports two distinct real-time pipelines:
 
-### A. Live Webcam Pipeline
-1. Frontend captures frames via HTML5 hidden canvas.
-2. `video_tracker.js` emits Base64 image strings to NiceGUI (WebSockets).
-3. Backend decodes the frame in `predict` and delegates to `infer`, executing synchronous `B=1` inference on the static `[1, 3, 640, 640]` `LATENCY`-optimized model.
-4. JSON coordinates returned and mapped to an SVG overlay.
+### A. Live Webcam Pipeline (Buffered & Interpolated)
+1. Frontend captures camera frames at native FPS into a FIFO `frameBuffer` with a monotonically increasing `frame_index` and timestamp.
+2. Frontend dilates inference requests (`frameDilation = 4` by default), emitting `frame_ready` (`{ frame_index, frame_data }`) over NiceGUI WebSockets only on dilated keyframes while the worker is free.
+3. Backend `process_frame` decodes the frame, runs synchronous `B=1` `LATENCY` inference, and passes `(frame_index, markers, inference_time_ms)` to `RealtimeFrameBufferInterpolator.record_inference`.
+4. Backend interpolates all intermediate frames `[prev_frame_index .. frame_index]` using the configured tunable method (`"linear"` by default, or `"kalman"`), checks if `inference_time_ms > 0.5 * buffer_delay_ms` (logging a warning and expanding `buffer_delay_ms` if needed), and returns the indexed payload.
+5. Frontend `displayCanvas` renders buffered video frames delayed by `bufferDelayMs` (`200 ms` default) and overlays the exact frame-synchronized markers (inferred or linearly interpolated between bracketing keyframes) on the SVG layer without lag.
 
 ### B. File Upload Batch Pipeline
 1. Frontend calculates exact duration and asks backend for an empirical ETA estimate (`/api/estimate`).

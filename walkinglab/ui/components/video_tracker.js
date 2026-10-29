@@ -23,23 +23,29 @@ export default {
                 </div>
             </div>
 
-            <!-- Video element used for BOTH webcam playback and file playback -->
+            <!-- Video element used for live webcam capture (hidden in webcam mode) and visible file playback -->
             <video ref="videoElement" 
                    class="w-full h-full object-contain" 
-                   :class="{ 'hidden': !activeMode }"
+                   :class="{ 'hidden': activeMode !== 'file' }"
                    playsinline 
                    muted 
                    controls 
-                   v-show="activeMode"></video>
+                   v-show="activeMode === 'file'"></video>
+
+            <!-- Buffered display canvas for 200ms delayed real-time webcam playback -->
+            <canvas ref="displayCanvas"
+                    class="w-full h-full object-contain"
+                    :class="{ 'hidden': activeMode !== 'webcam' }"
+                    v-show="activeMode === 'webcam'"></canvas>
             
-            <!-- Hidden canvas for capturing webcam frames -->
+            <!-- Hidden canvas for capturing and encoding webcam frames -->
             <canvas ref="hiddenCanvas" class="hidden"></canvas>
             
             <!-- SVG overlay for drawing markers -->
             <svg class="absolute top-0 left-0 w-full h-full pointer-events-none" v-if="activeMode">
-                <!-- Dummy skeleton markers -->
-                <circle v-for="(marker, i) in markers" :key="i" :cx="marker.x" :cy="marker.y" r="6" fill="#3b82f6" stroke="white" stroke-width="2" />
-                <!-- Dummy skeleton lines -->
+                <!-- Skeleton markers -->
+                <circle v-for="(marker, i) in markers" :key="marker.id !== undefined ? marker.id : i" :cx="marker.x" :cy="marker.y" r="6" fill="#3b82f6" stroke="white" stroke-width="2" />
+                <!-- Skeleton lines -->
                 <line v-if="markers.length >= 2" :x1="markers[0].x" :y1="markers[0].y" :x2="markers[1].x" :y2="markers[1].y" stroke="#3b82f6" stroke-width="3" />
             </svg>
 
@@ -70,7 +76,17 @@ export default {
             isProcessing: false,
             progressStage: '',
             progressPercent: 0,
-            estimatedSeconds: 0
+            estimatedSeconds: 0,
+            // Real-time 200ms buffer, frame indexing, dilation, and interpolation state
+            bufferDelayMs: 200,
+            frameDilation: 4,
+            interpolationMode: 'linear',
+            frameIndex: 0,
+            lastInferredFrameIndex: -4,
+            frameBuffer: [],
+            frameMarkersMap: {},
+            inferredKeyframes: [],
+            displayedFrameIndex: -1
         }
     },
     methods: {
@@ -81,11 +97,19 @@ export default {
                 video.srcObject = this.stream;
                 video.removeAttribute('controls'); // hide controls for live stream
                 await video.play();
+
+                this.frameIndex = 0;
+                this.lastInferredFrameIndex = -this.frameDilation;
+                this.frameBuffer = [];
+                this.frameMarkersMap = {};
+                this.inferredKeyframes = [];
+                this.displayedFrameIndex = -1;
+                this.markers = [];
                 this.activeMode = 'webcam';
                 
-                // Start capturing frames
+                // Start capturing frames into the 200ms buffer and dispatching dilated inference
                 this.captureFrame();
-                // Add dummy markers for webcam mode just to show it works
+                // Start synchronized delayed playback and marker interpolation loop
                 this.syncMarkers();
             } catch (err) {
                 console.error("Error accessing webcam:", err);
@@ -187,31 +211,62 @@ export default {
         },
         captureFrame() {
             if (this.activeMode !== 'webcam') return;
-            if (this.isProcessing) {
-                // Wait until the previous frame finishes processing
-                setTimeout(() => this.captureFrame(), 50);
-                return;
-            }
             
             const video = this.$refs.videoElement;
             const canvas = this.$refs.hiddenCanvas;
             
-            if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                
-                const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-                this.isProcessing = true;
-                this.$emit('frame_ready', dataUrl);
+            if (video && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
+                const currentIdx = this.frameIndex++;
+                const now = performance.now();
+
+                // Store frame snapshot in the real-time display buffer
+                const frameCanvas = document.createElement('canvas');
+                frameCanvas.width = video.videoWidth;
+                frameCanvas.height = video.videoHeight;
+                const frameCtx = frameCanvas.getContext('2d');
+                frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+
+                this.frameBuffer.push({
+                    frameIndex: currentIdx,
+                    timestamp: now,
+                    canvas: frameCanvas
+                });
+
+                // Cap buffer size to avoid unbounded memory growth
+                if (this.frameBuffer.length > 180) {
+                    this.frameBuffer.shift();
+                }
+
+                // Frame dilation: only dispatch every N-th frame when backend is idle
+                const shouldInfer = (currentIdx - this.lastInferredFrameIndex) >= this.frameDilation;
+                if (shouldInfer && !this.isProcessing) {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(frameCanvas, 0, 0);
+
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                    this.isProcessing = true;
+                    this.lastInferredFrameIndex = currentIdx;
+                    this.$emit('frame_ready', {
+                        frame_index: currentIdx,
+                        frame_data: dataUrl,
+                        buffer_delay_ms: this.bufferDelayMs,
+                        dilation_factor: this.frameDilation,
+                        interpolation_method: this.interpolationMode
+                    });
+                }
             }
             
-            setTimeout(() => this.captureFrame(), 30);
+            setTimeout(() => this.captureFrame(), 33);
         },
         calculateVideoBounds() {
             const video = this.$refs.videoElement;
-            const rect = video.getBoundingClientRect();
+            const displayEl = this.activeMode === 'webcam' ? this.$refs.displayCanvas : video;
+            if (!displayEl || !video || !video.videoWidth || !video.videoHeight) {
+                return { actualWidth: 0, actualHeight: 0, offsetX: 0, offsetY: 0 };
+            }
+            const rect = displayEl.getBoundingClientRect();
             const videoRatio = video.videoWidth / video.videoHeight;
             const containerRatio = rect.width / rect.height;
             
@@ -231,10 +286,147 @@ export default {
             
             return { actualWidth, actualHeight, offsetX, offsetY };
         },
+        interpolateMarkersLinear(startMarkers, endMarkers, alpha) {
+            if (!startMarkers || startMarkers.length === 0) {
+                return alpha >= 0.5 ? (endMarkers || []) : [];
+            }
+            if (!endMarkers || endMarkers.length === 0) {
+                return alpha < 0.5 ? startMarkers : [];
+            }
+
+            const clampedAlpha = Math.max(0.0, Math.min(1.0, alpha));
+            const hasIds = startMarkers[0].id !== undefined || endMarkers[0].id !== undefined;
+
+            if (hasIds) {
+                const startById = {};
+                const endById = {};
+                const allIds = [];
+
+                startMarkers.forEach(m => {
+                    if (m.id !== undefined) {
+                        startById[m.id] = m;
+                        allIds.push(m.id);
+                    }
+                });
+                endMarkers.forEach(m => {
+                    if (m.id !== undefined) {
+                        endById[m.id] = m;
+                        if (startById[m.id] === undefined) {
+                            allIds.push(m.id);
+                        }
+                    }
+                });
+
+                const result = [];
+                for (const id of allIds) {
+                    const m0 = startById[id];
+                    const m1 = endById[id];
+                    if (m0 && m1) {
+                        result.push({
+                            id: id,
+                            x: m0.x + clampedAlpha * (m1.x - m0.x),
+                            y: m0.y + clampedAlpha * (m1.y - m0.y)
+                        });
+                    } else if (m0 && clampedAlpha < 0.5) {
+                        result.push({ id: id, x: m0.x, y: m0.y });
+                    } else if (m1 && clampedAlpha >= 0.5) {
+                        result.push({ id: id, x: m1.x, y: m1.y });
+                    }
+                }
+                return result;
+            }
+
+            const count = Math.min(startMarkers.length, endMarkers.length);
+            const result = [];
+            for (let i = 0; i < count; i++) {
+                result.push({
+                    x: startMarkers[i].x + clampedAlpha * (endMarkers[i].x - startMarkers[i].x),
+                    y: startMarkers[i].y + clampedAlpha * (endMarkers[i].y - startMarkers[i].y)
+                });
+            }
+            return result;
+        },
+        getMarkersForFrame(targetFrameIdx) {
+            if (this.frameMarkersMap[targetFrameIdx] !== undefined) {
+                return this.frameMarkersMap[targetFrameIdx];
+            }
+
+            if (this.inferredKeyframes.length === 0) {
+                return [];
+            }
+
+            if (this.interpolationMode === 'none' || this.inferredKeyframes.length === 1) {
+                let latest = this.inferredKeyframes[0];
+                for (const kf of this.inferredKeyframes) {
+                    if (kf.frameIndex <= targetFrameIdx) {
+                        latest = kf;
+                    } else {
+                        break;
+                    }
+                }
+                return latest.markers || [];
+            }
+
+            let prevKf = null;
+            let nextKf = null;
+            for (const kf of this.inferredKeyframes) {
+                if (kf.frameIndex <= targetFrameIdx) {
+                    prevKf = kf;
+                } else if (kf.frameIndex > targetFrameIdx) {
+                    nextKf = kf;
+                    break;
+                }
+            }
+
+            if (prevKf && nextKf && nextKf.frameIndex > prevKf.frameIndex) {
+                const alpha = (targetFrameIdx - prevKf.frameIndex) / (nextKf.frameIndex - prevKf.frameIndex);
+                return this.interpolateMarkersLinear(prevKf.markers, nextKf.markers, alpha);
+            }
+
+            if (prevKf) {
+                return prevKf.markers || [];
+            }
+            return nextKf ? (nextKf.markers || []) : [];
+        },
         syncMarkers() {
             if (!this.activeMode) return;
             
-            if (this.activeMode === 'file' && this.all_frames_markers && this.all_frames_markers.length > 0) {
+            if (this.activeMode === 'webcam') {
+                const now = performance.now();
+                let readyIdx = -1;
+
+                for (let i = 0; i < this.frameBuffer.length; i++) {
+                    if (now - this.frameBuffer[i].timestamp >= this.bufferDelayMs) {
+                        readyIdx = i;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (readyIdx >= 0) {
+                    const entry = this.frameBuffer[readyIdx];
+                    this.frameBuffer.splice(0, readyIdx);
+
+                    const displayCanvas = this.$refs.displayCanvas;
+                    if (displayCanvas && entry.canvas) {
+                        if (displayCanvas.width !== entry.canvas.width || displayCanvas.height !== entry.canvas.height) {
+                            displayCanvas.width = entry.canvas.width;
+                            displayCanvas.height = entry.canvas.height;
+                        }
+                        const ctx = displayCanvas.getContext('2d');
+                        ctx.drawImage(entry.canvas, 0, 0);
+                        this.displayedFrameIndex = entry.frameIndex;
+
+                        const bounds = this.calculateVideoBounds();
+                        const rawMarkers = this.getMarkersForFrame(entry.frameIndex);
+                        this.markers = rawMarkers.map(m => ({
+                            id: m.id,
+                            x: bounds.offsetX + (m.x * bounds.actualWidth),
+                            y: bounds.offsetY + (m.y * bounds.actualHeight)
+                        }));
+                    }
+                }
+            } else if (this.activeMode === 'file' && this.all_frames_markers && this.all_frames_markers.length > 0) {
                 const video = this.$refs.videoElement;
                 if (video && video.readyState >= video.HAVE_METADATA && video.videoWidth > 0) {
                     const bounds = this.calculateVideoBounds();
@@ -243,6 +435,7 @@ export default {
                     if (frameIndex < this.all_frames_markers.length) {
                         const markers = this.all_frames_markers[frameIndex] || [];
                         this.markers = markers.map(m => ({
+                            id: m.id,
                             x: bounds.offsetX + (m.x * bounds.actualWidth),
                             y: bounds.offsetY + (m.y * bounds.actualHeight)
                         }));
@@ -252,15 +445,80 @@ export default {
             
             this.animationFrameId = requestAnimationFrame(this.syncMarkers);
         },
-        update_markers(markers) {
+        update_markers(payload) {
             this.isProcessing = false;
-            const video = this.$refs.videoElement;
-            if (video && video.readyState >= video.HAVE_METADATA && video.videoWidth > 0) {
-                const bounds = this.calculateVideoBounds();
-                this.markers = markers.map(m => ({
-                    x: bounds.offsetX + (m.x * bounds.actualWidth),
-                    y: bounds.offsetY + (m.y * bounds.actualHeight)
-                }));
+            if (!payload) return;
+
+            // Legacy array mode fallback
+            if (Array.isArray(payload)) {
+                const video = this.$refs.videoElement;
+                if (video && video.readyState >= video.HAVE_METADATA && video.videoWidth > 0) {
+                    const bounds = this.calculateVideoBounds();
+                    this.markers = payload.map(m => ({
+                        id: m.id,
+                        x: bounds.offsetX + (m.x * bounds.actualWidth),
+                        y: bounds.offsetY + (m.y * bounds.actualHeight)
+                    }));
+                }
+                return;
+            }
+
+            // Indexed real-time payload mode
+            if (payload.buffer_delay_ms && payload.buffer_delay_ms !== this.bufferDelayMs) {
+                if (payload.buffer_adjusted) {
+                    console.warn(
+                        `[VideoTracker] Inference time (${(payload.inference_time_ms || 0).toFixed(1)} ms) ` +
+                        `exceeded half of buffer delay (${this.bufferDelayMs} ms). ` +
+                        `Adjusting buffer delay to ${payload.buffer_delay_ms} ms.`
+                    );
+                }
+                this.bufferDelayMs = payload.buffer_delay_ms;
+            }
+
+            if (payload.dilation_factor) {
+                this.frameDilation = payload.dilation_factor;
+            }
+            if (payload.interpolation_method) {
+                this.interpolationMode = payload.interpolation_method;
+            }
+
+            if (payload.interpolated_frames) {
+                for (const [k, v] of Object.entries(payload.interpolated_frames)) {
+                    this.frameMarkersMap[ parseInt(k, 10) ] = v;
+                }
+            }
+
+            if (payload.frame_index !== undefined && Array.isArray(payload.markers)) {
+                const fIdx = parseInt(payload.frame_index, 10);
+                this.frameMarkersMap[fIdx] = payload.markers;
+                this.inferredKeyframes.push({
+                    frameIndex: fIdx,
+                    markers: payload.markers
+                });
+                this.inferredKeyframes.sort((a, b) => a.frameIndex - b.frameIndex);
+                if (this.inferredKeyframes.length > 60) {
+                    this.inferredKeyframes.shift();
+                }
+
+                // Prune old frameMarkersMap entries
+                const minKeepIdx = fIdx - 300;
+                for (const key of Object.keys(this.frameMarkersMap)) {
+                    if (parseInt(key, 10) < minKeepIdx) {
+                        delete this.frameMarkersMap[key];
+                    }
+                }
+            }
+        },
+        set_tracking_config(config) {
+            if (!config) return;
+            if (config.bufferDelayMs !== undefined && config.bufferDelayMs > 0) {
+                this.bufferDelayMs = config.bufferDelayMs;
+            }
+            if (config.frameDilation !== undefined && config.frameDilation >= 1) {
+                this.frameDilation = config.frameDilation;
+            }
+            if (config.interpolationMode !== undefined) {
+                this.interpolationMode = config.interpolationMode;
             }
         },
         set_batch_markers(all_markers) {
@@ -282,6 +540,10 @@ export default {
             }
             this.activeMode = null;
             this.markers = [];
+            this.frameBuffer = [];
+            this.frameMarkersMap = {};
+            this.inferredKeyframes = [];
+            this.displayedFrameIndex = -1;
         }
     },
     beforeUnmount() {
