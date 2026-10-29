@@ -16,6 +16,7 @@ htmlcov/
 .mypy_cache/
 
 # Data and Models
+dummy_vids/
 *.mp4
 *.avi
 *.mov

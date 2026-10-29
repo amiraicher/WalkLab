@@ -4,10 +4,7 @@ Automated test suite for the split real-time and batch OpenVINO inference pipeli
 import base64
 from pathlib import Path
 
-import cv2
-import numpy as np
-import openvino as ov
-
+import walkinglab  # noqa: F401
 from walkinglab.backend.inference import (
     BATCH_SIZE,
     _pad_batch,
@@ -15,6 +12,9 @@ from walkinglab.backend.inference import (
     process_frame,
     process_video_file,
 )
+import cv2
+import numpy as np
+import openvino as ov
 
 
 def test_realtime_pipeline_compilation():
@@ -38,7 +38,7 @@ def test_realtime_pipeline_compilation():
     perf_mode = est.realtime_compiled_model.get_property(
         ov.properties.hint.performance_mode()
     )
-    assert perf_mode == ov.properties.hint.PerformanceMode.LATENCY
+    assert perf_mode in (ov.properties.hint.PerformanceMode.LATENCY, "LATENCY")
 
 
 def test_batch_pipeline_compilation():
@@ -57,7 +57,7 @@ def test_batch_pipeline_compilation():
     perf_mode = batch_model.get_property(
         ov.properties.hint.performance_mode()
     )
-    assert perf_mode == ov.properties.hint.PerformanceMode.THROUGHPUT
+    assert perf_mode in (ov.properties.hint.PerformanceMode.THROUGHPUT, "THROUGHPUT")
 
 
 def test_realtime_infer_and_predict():
