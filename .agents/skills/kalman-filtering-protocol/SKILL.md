@@ -1,11 +1,5 @@
 ---
-
-### Skill 2: `kalman-filtering-protocol`
-**Path:** `skills/kalman-gait-guidelines/SKILL.md`
-
-```markdown
----
-name: kalman-gait-guidelines
+name: kalman-filtering-protocol
 description: Behavioral protocols and parameter constraints for applying Kalman filtering to noisy kinematic trajectories. Use when writing or tuning trajectory smoothing and gait segmentation logic.
 ---
 

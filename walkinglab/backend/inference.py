@@ -84,9 +84,12 @@ class PoseEstimator:
         model_path : str
             Path to the YOLO PyTorch (``.pt``) or OpenVINO (``.xml``) model file.
         """
+        self._weights_path = model_path
         if model_path.endswith(".pt"):
             ov_dir = model_path.replace(".pt", "_openvino_model")
-            ov_xml = os.path.join(ov_dir, model_path.replace(".pt", ".xml"))
+            ov_xml = os.path.join(
+                ov_dir, os.path.basename(model_path).replace(".pt", ".xml")
+            )
             if not os.path.exists(ov_xml):
                 logger.info(f"OpenVINO model not found. Exporting {model_path}...")
                 model = YOLO(model_path)
@@ -103,6 +106,34 @@ class PoseEstimator:
         )
         self.realtime_infer_request = self.realtime_compiled_model.create_infer_request()
         self._batch_compiled_model: ov.CompiledModel | None = None
+
+    @property
+    def weights_path(self) -> str:
+        """
+        Returns the configured model weights path for this estimator instance.
+
+        Returns
+        -------
+        str
+            Path to the model weights file.
+        """
+        return self._weights_path
+
+    @weights_path.setter
+    def weights_path(self, value: str | None) -> None:
+        """
+        Updates the configured model weights path on this estimator instance.
+
+        Parameters
+        ----------
+        value : str or None
+            New model weights path, or ``None`` to reset to ``"yolo26s-pose.pt"``.
+        """
+        self._weights_path = (
+            str(value).strip()
+            if (value and str(value).strip())
+            else "yolo26s-pose.pt"
+        )
 
     def _compile_pipeline(
         self,
@@ -349,7 +380,7 @@ def get_estimator() -> PoseEstimator:
     """
     global estimator
     if estimator is None:
-        estimator = PoseEstimator("yolo26s-pose.pt")
+        estimator = PoseEstimator(config.active_weights_path)
     return estimator
 
 
@@ -588,3 +619,81 @@ def process_video_file(file_info: dict) -> list:
     # Return only the frames we actually read
     return all_markers[:frame_idx]
 
+
+class InferenceConfig:
+    """
+    Lightweight configuration holder managing the active YOLO-Pose model weights path
+    using ``@property`` getter/setter semantics without loading models upfront.
+    """
+
+    def __init__(self, default_weights_path: str = "yolo26s-pose.pt") -> None:
+        self._active_weights_path: str = default_weights_path
+
+    @property
+    def active_weights_path(self) -> str:
+        """
+        Retrieves the currently configured YOLO-Pose model weights path.
+
+        Returns
+        -------
+        str
+            Active model weights path (e.g., ``"yolo26s-pose.pt"``).
+        """
+        return self._active_weights_path
+
+    @active_weights_path.setter
+    def active_weights_path(self, weights_path: str | None) -> None:
+        """
+        Sets the active YOLO-Pose model weights path without loading the model upfront.
+
+        If the weights path changes, resets the global ``estimator`` singleton to ``None``
+        so the new weights are lazily compiled on the next inference request.
+
+        Parameters
+        ----------
+        weights_path : str or None
+            Path to a custom ``.pt`` or ``.xml`` weights file, or ``None`` to reset to
+            the default ``"yolo26s-pose.pt"``.
+        """
+        global estimator
+        normalized = (
+            str(weights_path).strip()
+            if (weights_path and str(weights_path).strip())
+            else "yolo26s-pose.pt"
+        )
+        if normalized != self._active_weights_path:
+            self._active_weights_path = normalized
+            estimator = None
+
+
+config = InferenceConfig()
+
+
+def set_active_weights_path(weights_path: str | None = None) -> str:
+    """
+    Sets ``config.active_weights_path`` and returns the resolved path.
+
+    Parameters
+    ----------
+    weights_path : str or None, optional
+        Path to a custom ``.pt`` or ``.xml`` weights file, or ``None`` for default.
+
+    Returns
+    -------
+    str
+        The newly active weights path.
+    """
+    config.active_weights_path = weights_path
+    return config.active_weights_path
+
+
+def get_active_weights_path() -> str:
+    """
+    Retrieves ``config.active_weights_path``.
+
+    Returns
+    -------
+    str
+        Active model weights path.
+    """
+    return config.active_weights_path
